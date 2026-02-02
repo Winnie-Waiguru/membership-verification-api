@@ -20,9 +20,24 @@ const pool = new Pool({
 });
 
 // Routes
+
+// Get members data from the database
+app.post("/api/members/check", async (req, res) => {
+  const { name } = req.body;
+  try {
+    const result = await pool.query(
+      "SELECT full_name, award_type FROM members WHERE full_name = $1 AND paid = true",
+      [name],
+    );
+    res.status(200).json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: `Database error: ${error.message}` });
+  }
+});
+// save members data to the database
 app.post("/api/members", async (req, res) => {
   const { name, school, awardType, year, paid } = req.body;
-  // save members data to the database
+
   try {
     const result = await pool.query(
       "INSERT INTO members (full_name, school, award_type, award_year, paid) VALUES ($1, $2, $3, $4, $5) RETURNING *",
