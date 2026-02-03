@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Logs
+npm-debug.log*
+*.log
+
+# Environment variables
+.env
+
+# Build results
+/build
+/dist
+/public/assets # if generated
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+
+# Testing and Coverage
+/coverage
+
+# Typings
+/typings
