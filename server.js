@@ -41,8 +41,6 @@ const getMpesaToken = async () => {
 const initiateStkPush = async (phoneNumber, amount) => {
   const token = await getMpesaToken();
 
-  // Convert number to correct format
-  const formattedPhone = phoneNumber.replace(/^0/, "254");
   // Generate timestamp in the format YYYYMMDDHHMMSS
   const timestamp = new Date()
     .toISOString()
@@ -65,9 +63,9 @@ const initiateStkPush = async (phoneNumber, amount) => {
       Timestamp: timestamp,
       TransactionType: "CustomerPayBillOnline",
       Amount: amount,
-      PartyA: formattedPhone,
+      PartyA: phoneNumber,
       PartyB: process.env.MPESA_SHORT_CODE,
-      PhoneNumber: formattedPhone,
+      PhoneNumber: phoneNumber,
       CallBackURL:
         "https://nontesting-uncapering-kasie.ngrok-free.dev/api/mpesa/callback",
       AccountReference: "Membership Payment",
@@ -86,32 +84,74 @@ const initiateStkPush = async (phoneNumber, amount) => {
 
 // payment token route
 app.post("/api/register", async (req, res) => {
+  // get client from the pool
+  const client = await pool.connect();
+
   try {
     const { full_name, school, award_type, award_year, phone_number, amount } =
       req.body;
 
     let membership_type;
-    if (amount === 1) membership_type = "lifetime";
-    else if (amount === 2000) membership_type = "monthly";
+    if (amount === 1)
+      membership_type = "lifetime"; //testing amount
+    else if (amount === 2)
+      membership_type = "monthly"; //testing amount
     else return res.status(400).json({ error: "Invalid amount" });
 
-    const payment = await pool.query(
-      `INSERT INTO payment_requests 
-     (full_name, school, award_type, award_year, membership_type, phone_number, amount)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [
-        full_name,
-        school,
-        award_type,
-        award_year,
-        membership_type,
-        phone_number,
-        amount,
-      ],
+    // Format phone number
+    let formattedPhone = phone_number;
+    if (formattedPhone.startsWith("0")) {
+      formattedPhone = "254" + formattedPhone.slice(1);
+    }
+
+    await client.query("BEGIN"); //start transaction
+
+    // check if the record of previous user exists with status pending
+    const existing = await client.query(
+      `SELECT * FROM payment_requests 
+   WHERE full_name=$1 AND award_type=$2 AND award_year=$3 AND status='pending'`,
+      [full_name, award_type, award_year],
     );
 
+    let payment;
+
+    // if exists phone_number, amount, membership_type can be changed
+    if (existing.rows.length > 0) {
+      payment = await client.query(
+        `UPDATE payment_requests
+     SET phone_number=$1, amount=$2, membership_type=$3, created_at=NOW()
+     WHERE id=$4
+     RETURNING *`,
+        [formattedPhone, amount, membership_type, existing.rows[0].id],
+      );
+    } else {
+      // Insert new request
+      payment = await client.query(
+        `INSERT INTO payment_requests
+     (full_name, school, award_type, award_year, membership_type, phone_number, amount)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     RETURNING *`,
+        [
+          full_name,
+          school,
+          award_type,
+          award_year,
+          membership_type,
+          formattedPhone,
+          amount,
+        ],
+      );
+    }
+
+    await client.query("COMMIT"); //Commit transaction if all goes well
+
     // Intiate stk push
-    const stkResponse = await initiateStkPush(phone_number, amount);
+    const stkResponse = await initiateStkPush(formattedPhone, amount);
+
+    // check if the stk push returned
+    if (!stkResponse?.CheckoutRequestID) {
+      return res.status(500).json({ error: "STK push failed" });
+    }
 
     // Save checkout request id
     await pool.query(
@@ -122,12 +162,16 @@ app.post("/api/register", async (req, res) => {
     res.status(200).json({
       message: "STK push sent to phone",
       checkoutRequestID: stkResponse.CheckoutRequestID,
+      paymentId: payment.rows[0].id,
     });
   } catch (error) {
+    await client.query("ROLLBACK"); //Undo all if something fails
     res.status(500).json({
       error: "Payment initiation failed",
-      details: error.response ? error.response.data : error.message,
+      details: error.response?.data || error.message,
     });
+  } finally {
+    client.release(); //release client back to the pool
   }
 });
 
