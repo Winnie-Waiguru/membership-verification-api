@@ -177,49 +177,114 @@ app.post("/api/register", async (req, res) => {
 
 // Mpesa response from Saf
 app.post("/api/mpesa/callback", async (req, res) => {
+  const client = await pool.connect();
+
   try {
     console.log("MPESA CALLBACK:", JSON.stringify(req.body, null, 2));
+
     const response = req.body.Body.stkCallback;
 
-    if (response.ResultCode === 0) {
-      const checkOutId = response.CheckoutRequestID;
+    if (response.ResultCode !== 0) {
+      return res.status(200).json({ ResultCode: 0, ResultDesc: "Rejected" });
+    }
 
-      const payment = await pool.query(
-        "SELECT * FROM payment_requests WHERE checkout_request_id=$1",
-        [checkOutId],
-      );
+    const checkoutId = response.CheckoutRequestID;
 
-      // Check if any row was returned
-      if (payment.rows.length === 0) {
-        console.error("Payment not found for CheckoutRequestID:", checkOutId);
-        return res.status(404).json({ error: "Payment request not found" });
+    await client.query("BEGIN");
+
+    // 1. Get payment request
+    const paymentResult = await client.query(
+      "SELECT * FROM payment_requests WHERE checkout_request_id=$1 FOR UPDATE",
+      [checkoutId],
+    );
+
+    if (paymentResult.rows.length === 0) {
+      throw new Error("Payment request not found");
+    }
+
+    const user = paymentResult.rows[0];
+
+    // 2. Check existing member
+    const memberResult = await client.query(
+      "SELECT * FROM members WHERE full_name=$1 AND award_type=$2 AND award_year=$3",
+      [user.full_name, user.award_type, user.award_year],
+    );
+
+    let expiryDate = null;
+
+    if (user.membership_type === "monthly") {
+      let baseDate = new Date();
+
+      if (
+        memberResult.rows.length > 0 &&
+        memberResult.rows[0].expires_at &&
+        new Date(memberResult.rows[0].expires_at) > new Date()
+      ) {
+        // carry forward
+        baseDate = new Date(memberResult.rows[0].expires_at);
       }
 
-      // Get users details
-      const user = payment.rows[0];
+      baseDate.setMonth(baseDate.getMonth() + 1);
+      expiryDate = baseDate.toISOString().split("T")[0];
+    }
 
-      // Insert into members table
-      await pool.query(
-        "INSERT INTO members (full_name, school, award_type, award_year,membership_type , paid) VALUES ($1, $2, $3, $4, $5, true)",
+    // 3. Insert or update member
+    if (memberResult.rows.length === 0) {
+      // New member
+      await client.query(
+        `INSERT INTO members 
+         (full_name, school, award_type, award_year, membership_type, paid, expires_at)
+         VALUES ($1,$2,$3,$4,$5,true,$6)`,
         [
           user.full_name,
           user.school,
           user.award_type,
           user.award_year,
           user.membership_type,
+          expiryDate,
         ],
       );
+    } else {
+      // Existing member
+      let newMembershipType = memberResult.rows[0].membership_type;
 
-      // update  payment status
-      await pool.query(
-        "UPDATE payment_requests SET status='paid' WHERE checkout_request_id=$1",
-        [checkOutId],
+      if (user.membership_type === "lifetime") {
+        newMembershipType = "lifetime";
+        expiryDate = null;
+      }
+
+      await client.query(
+        `UPDATE members
+         SET membership_type=$1,
+             paid=true,
+             expires_at=$2
+         WHERE full_name=$3 AND award_type=$4 AND award_year=$5`,
+        [
+          newMembershipType,
+          expiryDate,
+          user.full_name,
+          user.award_type,
+          user.award_year,
+        ],
       );
     }
 
-    res.status(201).json({ ResultCode: 0, ResultDesc: "Accepted" });
+    // 4. Update payment request status
+    await client.query(
+      "UPDATE payment_requests SET status='paid' WHERE checkout_request_id=$1",
+      [checkoutId],
+    );
+
+    await client.query("COMMIT");
+
+    res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
   } catch (error) {
-    res.status(500).json({ "Callback Error": error.message });
+    await client.query("ROLLBACK");
+    console.error("Callback Error:", error.message);
+
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -229,7 +294,7 @@ app.post("/api/members/check", async (req, res) => {
   const { name } = req.body;
   try {
     const result = await pool.query(
-      "SELECT full_name, award_type FROM members WHERE full_name = $1 AND paid = true",
+      "SELECT full_name, award_type FROM members WHERE full_name = $1 AND paid = true AND ( membership_type = 'lifetime' OR expires_at >= CURRENT_DATE",
       [name],
     );
     if (result.rows.length === 0) {
@@ -237,20 +302,6 @@ app.post("/api/members/check", async (req, res) => {
     }
 
     res.status(200).json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: `Database error: ${error.message}` });
-  }
-});
-// save members data to the database
-app.post("/api/members", async (req, res) => {
-  const { name, school, awardType, year, paid } = req.body;
-
-  try {
-    const result = await pool.query(
-      "INSERT INTO members (full_name, school, award_type, award_year, paid) VALUES ($1, $2, $3, $4, $5) RETURNING *",
-      [name, school, awardType, year, paid],
-    );
-    res.status(201).json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: `Database error: ${error.message}` });
   }
