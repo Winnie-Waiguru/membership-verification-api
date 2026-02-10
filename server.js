@@ -3,6 +3,8 @@ import express from "express";
 import { Pool } from "pg";
 import cors from "cors";
 import dotenv from "dotenv";
+import nodemailer from "nodemailer";
+import cron from "node-cron";
 
 dotenv.config();
 
@@ -82,14 +84,55 @@ const initiateStkPush = async (phoneNumber, amount) => {
   return stkRequestBody.data;
 };
 
+// ---------- EMAIL NOTIFIER ----------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+});
+
+const sendExpiryEmails = async () => {
+  try {
+    const today = new Date().toISOString().split("T")[0];
+
+    const result = await pool.query(
+      "SELECT full_name, email FROM members WHERE expires_at = $1",
+      [today],
+    );
+
+    for (let member of result.rows) {
+      await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to: member.email,
+        subject: "Subscription Expiry Notice",
+        text: `Hi ${member.full_name}, your subscription expires today. Please renew to continue enjoying our services.`,
+      });
+      console.log(`Expiry email sent to: ${member.email}`);
+    }
+  } catch (error) {
+    console.error("Error sending expiry emails:", error.message);
+  }
+};
+
+// Schedule daily check at 8 AM
+cron.schedule("0 8 * * *", () => {
+  sendExpiryEmails();
+});
+
 // payment token route
 app.post("/api/register", async (req, res) => {
   // get client from the pool
   const client = await pool.connect();
 
   try {
-    const { full_name, school, award_type, award_year, phone_number, amount } =
-      req.body;
+    const {
+      full_name,
+      school,
+      award_type,
+      award_year,
+      phone_number,
+      amount,
+      email,
+    } = req.body;
 
     let membership_type;
     if (amount === 1)
@@ -119,16 +162,16 @@ app.post("/api/register", async (req, res) => {
     if (existing.rows.length > 0) {
       payment = await client.query(
         `UPDATE payment_requests
-     SET phone_number=$1, amount=$2, membership_type=$3, created_at=NOW()
-     WHERE id=$4
+     SET phone_number=$1, amount=$2, membership_type=$3, email=$4, created_at=NOW()
+     WHERE id=$5
      RETURNING *`,
-        [formattedPhone, amount, membership_type, existing.rows[0].id],
+        [formattedPhone, amount, membership_type, email, existing.rows[0].id],
       );
     } else {
       // Insert new request
       payment = await client.query(
         `INSERT INTO payment_requests
-     (full_name, school, award_type, award_year, membership_type, phone_number, amount)
+     (full_name, school, award_type, award_year, membership_type, phone_number, amount, email)
      VALUES ($1,$2,$3,$4,$5,$6,$7)
      RETURNING *`,
         [
@@ -139,6 +182,7 @@ app.post("/api/register", async (req, res) => {
           membership_type,
           formattedPhone,
           amount,
+          email,
         ],
       );
     }
@@ -233,8 +277,8 @@ app.post("/api/mpesa/callback", async (req, res) => {
       // New member
       await client.query(
         `INSERT INTO members 
-         (full_name, school, award_type, award_year, membership_type, paid, expires_at)
-         VALUES ($1,$2,$3,$4,$5,true,$6)`,
+         (full_name, school, award_type, award_year, membership_type, paid, expires_at, email)
+         VALUES ($1,$2,$3,$4,$5,true,$6, $7)`,
         [
           user.full_name,
           user.school,
@@ -242,6 +286,7 @@ app.post("/api/mpesa/callback", async (req, res) => {
           user.award_year,
           user.membership_type,
           expiryDate,
+          user.email,
         ],
       );
     } else {
@@ -288,13 +333,12 @@ app.post("/api/mpesa/callback", async (req, res) => {
   }
 });
 
-// Routes
 // Get members data from the database based on the provided name & paid status
 app.post("/api/members/check", async (req, res) => {
   const { name } = req.body;
   try {
     const result = await pool.query(
-      "SELECT full_name, award_type FROM members WHERE full_name = $1 AND paid = true AND ( membership_type = 'lifetime' OR expires_at >= CURRENT_DATE",
+      "SELECT full_name, award_type FROM members WHERE full_name = $1 AND paid = true AND ( membership_type = 'lifetime' OR expires_at >= CURRENT_DATE)",
       [name],
     );
     if (result.rows.length === 0) {
@@ -310,3 +354,6 @@ app.post("/api/members/check", async (req, res) => {
 app.listen(port, () => {
   console.log(`Server is running on http://localhost:${port}`);
 });
+
+// For testing only — triggers the email immediately
+sendExpiryEmails().then(() => console.log("Test email sent!"));
