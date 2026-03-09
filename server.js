@@ -5,6 +5,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
 import cron from "node-cron";
+import { upload } from "./upload.js";
+import fs from "fs";
 
 dotenv.config();
 
@@ -114,99 +116,174 @@ const sendExpiryEmails = async () => {
 cron.schedule("0 8 * * *", sendExpiryEmails);
 
 // REGISTER (before payment)
-app.post("/api/register", async (req, res) => {
-  const client = await pool.connect();
-
-  try {
-    const data = req.body;
-
-    // Determine membership type based on amount
-    let membership_type;
-    if (data.amount === 1) membership_type = "lifetime";
-    else if (data.amount === 2) membership_type = "monthly";
-    else return res.status(400).json({ error: "Invalid amount" });
-
-    // Normalize phone
-    let phone = data.phone_number;
-    if (phone.startsWith("0")) phone = "254" + phone.slice(1);
-
-    await client.query("BEGIN");
-
-    // Insert payment request
-    const insert = await client.query(
-      `INSERT INTO payment_requests (
-        full_name, date_of_birth, gender, nationality, id_passport_number,
-        email, phone_number, award_center_name, award_center_county,
-        highest_award_level_achieved, award_year, occupation, experience_level,
-        current_employer, linkedin_profile_link, areas_of_interest,
-        skills_expertise, aspirations, membership_type,
-        national_id_document, award_certificate_document, passport_photo,
-        amount
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
-      ) RETURNING *`,
-      [
-        data.full_name,
-        data.date_of_birth,
-        data.gender,
-        data.nationality,
-        data.id_passport_number,
-        data.email,
-        phone,
-        data.award_center_name,
-        data.award_center_county,
-        data.highest_award_level_achieved,
-        data.award_year,
-        data.occupation,
-        data.experience_level,
-        data.current_employer,
-        data.linkedin_profile_link,
-        data.areas_of_interest,
-        data.skills_expertise,
-        data.aspirations,
-        membership_type,
-        data.national_id_document,
-        data.award_certificate_document,
-        data.passport_photo,
-        data.amount,
-      ],
-    );
-
-    let stkCheckoutId = null;
-
-    // Attempt STK Push, but don’t fail registration if it fails
+app.post(
+  "/api/register",
+  upload.fields([
+    { name: "national_id_document", maxCount: 1 },
+    { name: "award_certificate_document", maxCount: 1 },
+    { name: "passport_photo", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    const client = await pool.connect();
     try {
-      const stk = await initiateStkPush(phone, data.amount);
-      stkCheckoutId = stk.CheckoutRequestID;
+      const data = req.body;
+      const amount = Number(data.amount); // ensure numeric
 
-      await client.query(
+      // Determine membership type
+      let membership_type;
+      if (amount === 1) membership_type = "lifetime";
+      else if (amount === 2) membership_type = "monthly";
+      else return res.status(400).json({ error: "Invalid amount" });
+
+      // Normalize phone
+      let phone = data.phone_number;
+      if (phone.startsWith("0")) phone = "254" + phone.slice(1);
+
+      await client.query("BEGIN");
+
+      // Check if member already exists
+      const existing = await client.query(
+        "SELECT * FROM members WHERE id_passport_number=$1",
+        [data.id_passport_number],
+      );
+
+      // Prepare file paths
+      let nationalIdPath = req.files.national_id_document?.[0]?.path;
+      let certificatePath = req.files.award_certificate_document?.[0]?.path;
+      let passportPath = req.files.passport_photo?.[0]?.path;
+
+      // If member exists, handle file replacements
+      if (existing.rows.length > 0) {
+        const member = existing.rows[0];
+
+        // Delete old files if new ones uploaded
+        if (nationalIdPath && member.national_id_document)
+          fs.unlinkSync(member.national_id_document);
+        if (certificatePath && member.award_certificate_document)
+          fs.unlinkSync(member.award_certificate_document);
+        if (passportPath && member.passport_photo)
+          fs.unlinkSync(member.passport_photo);
+
+        // Update member info
+        await client.query(
+          `UPDATE members SET
+            full_name=$1, date_of_birth=$2, gender=$3, nationality=$4,
+            email=$5, phone_number=$6, award_center_name=$7, award_center_county=$8,
+            highest_award_level_achieved=$9, award_year=$10, occupation=$11,
+            experience_level=$12, current_employer=$13, linkedin_profile_link=$14,
+            areas_of_interest=$15, skills_expertise=$16, aspirations=$17,
+            membership_type=$18,
+            national_id_document=COALESCE($19, national_id_document),
+            award_certificate_document=COALESCE($20, award_certificate_document),
+            passport_photo=COALESCE($21, passport_photo)
+          WHERE id_passport_number=$22`,
+          [
+            data.full_name,
+            data.date_of_birth,
+            data.gender,
+            data.nationality,
+            data.email,
+            phone,
+            data.award_center_name,
+            data.award_center_county,
+            data.highest_award_level_achieved,
+            data.award_year,
+            data.occupation,
+            data.experience_level,
+            data.current_employer,
+            data.linkedin_profile_link,
+            data.areas_of_interest,
+            data.skills_expertise,
+            data.aspirations,
+            membership_type,
+            nationalIdPath,
+            certificatePath,
+            passportPath,
+            data.id_passport_number,
+          ],
+        );
+
+        await client.query("COMMIT");
+        return res.json({ message: "Member info updated successfully" });
+      }
+
+      // If member does NOT exist, check pending payment request
+      const pending = await client.query(
+        "SELECT * FROM payment_requests WHERE id_passport_number=$1 AND status IS NULL",
+        [data.id_passport_number],
+      );
+      if (pending.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ error: "Registration already pending payment" });
+      }
+
+      // Insert new payment request
+      const insert = await client.query(
+        `INSERT INTO payment_requests (
+          full_name, date_of_birth, gender, nationality, id_passport_number,
+          email, phone_number, award_center_name, award_center_county,
+          highest_award_level_achieved, award_year, occupation, experience_level,
+          current_employer, linkedin_profile_link, areas_of_interest,
+          skills_expertise, aspirations, membership_type,
+          national_id_document, award_certificate_document, passport_photo,
+          amount
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+          $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+        ) RETURNING *`,
+        [
+          data.full_name,
+          data.date_of_birth,
+          data.gender,
+          data.nationality,
+          data.id_passport_number,
+          data.email,
+          phone,
+          data.award_center_name,
+          data.award_center_county,
+          data.highest_award_level_achieved,
+          data.award_year,
+          data.occupation,
+          data.experience_level,
+          data.current_employer,
+          data.linkedin_profile_link,
+          data.areas_of_interest,
+          data.skills_expertise,
+          data.aspirations,
+          membership_type,
+          nationalIdPath,
+          certificatePath,
+          passportPath,
+          amount,
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      // Trigger MPESA payment
+      const stkResponse = await initiateStkPush(phone, amount);
+
+      // Save CheckoutRequestID so callback can match payment
+      await pool.query(
         "UPDATE payment_requests SET checkout_request_id=$1 WHERE id=$2",
-        [stkCheckoutId, insert.rows[0].id],
+        [stkResponse.CheckoutRequestID, insert.rows[0].id],
       );
+
+      res.json({
+        message: "Registration successful. Payment prompt sent.",
+        paymentRequestId: insert.rows[0].id,
+        mpesaResponse: stkResponse,
+      });
     } catch (err) {
-      console.error(
-        "STK Push failed, payment request created anyway:",
-        err.response?.data || err.message,
-      );
+      await client.query("ROLLBACK");
+      res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
     }
-
-    await client.query("COMMIT");
-
-    res.json({
-      message: "Registration successful",
-      checkoutRequestID: stkCheckoutId,
-      note: stkCheckoutId
-        ? "STK Push initiated"
-        : "STK Push failed, try again later",
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
+  },
+);
 
 // MPESA CALLBACK
 app.post("/api/mpesa/callback", async (req, res) => {
